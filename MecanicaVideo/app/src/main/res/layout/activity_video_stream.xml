@@ -7,21 +7,26 @@
     android:layout_height="match_parent"
     tools:context=".MainActivity">
 
-    <RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root_layout"
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
+    <!-- Remote video view (em tela cheia) -->
     <org.webrtc.SurfaceViewRenderer
-        android:id="@+id/localView"
-        android:layout_width="100dp"
-        android:layout_height="150dp"
-        android:layout_alignParentTop="true"
-        android:layout_alignParentEnd="true"
-        android:layout_margin="10dp" />
-
-    <org.webrtc.SurfaceViewRenderer
-        android:id="@+id/remoteView"
+        android:id="@+id/remote_view"
         android:layout_width="match_parent"
-        android:layout_height="match_parent" />
-    </RelativeLayout>
+        android:layout_height="match_parent"
+        android:layout_gravity="center"
+        android:keepScreenOn="true" />
+
+    <!-- Local video view (em miniatura no canto inferior direito) -->
+    <org.webrtc.SurfaceViewRenderer
+        android:id="@+id/local_view"
+        android:layout_width="120dp"
+        android:layout_height="160dp"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="16dp"
+        android:keepScreenOn="true" />
+</FrameLayout>
 </androidx.constraintlayout.widget.ConstraintLayout>
