@@ -2,9 +2,11 @@ package com.example.mecanicavideo;
 
 import android.Manifest;
 import android.content.pm.PackageManager;
+import android.media.MediaRecorder;
 import android.os.Bundle;
 import android.util.Log;
-import android.view.View;
+import android.view.Surface;
+import android.widget.Button;
 
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
@@ -15,23 +17,30 @@ import org.json.JSONObject;
 import org.webrtc.AudioSource;
 import org.webrtc.AudioTrack;
 import org.webrtc.Camera2Enumerator;
+import org.webrtc.DataChannel;
 import org.webrtc.DefaultVideoDecoderFactory;
 import org.webrtc.DefaultVideoEncoderFactory;
 import org.webrtc.EglBase;
 import org.webrtc.IceCandidate;
 import org.webrtc.MediaConstraints;
 import org.webrtc.MediaStream;
-import org.webrtc.MediaStreamTrack;
 import org.webrtc.PeerConnection;
 import org.webrtc.PeerConnectionFactory;
+import org.webrtc.RtpReceiver;
+import org.webrtc.SessionDescription;
 import org.webrtc.SurfaceTextureHelper;
 import org.webrtc.SurfaceViewRenderer;
 import org.webrtc.VideoCapturer;
+import org.webrtc.VideoSink;
 import org.webrtc.VideoSource;
 import org.webrtc.VideoTrack;
 
+import java.io.DataOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.Collections;
-import java.util.List;
 
 public class VideoStreamActivity extends AppCompatActivity implements SignalingClient.SignalingEvents {
 
@@ -42,7 +51,6 @@ public class VideoStreamActivity extends AppCompatActivity implements SignalingC
     private PeerConnection peerConnection;
 
     private SurfaceViewRenderer localView;
-    private SurfaceViewRenderer remoteView;
 
     private VideoTrack localVideoTrack;
     private AudioTrack localAudioTrack;
@@ -56,26 +64,32 @@ public class VideoStreamActivity extends AppCompatActivity implements SignalingC
 
     private SurfaceTextureHelper surfaceTextureHelper;
 
+    private MediaRecorder mediaRecorder;
+    private boolean isRecording = false;
+    private String recordedFilePath;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_video_stream);
 
-        localView = findViewById(R.id.local_view);
-        remoteView = findViewById(R.id.remote_view);
+        localView = findViewById(R.id.remote_view);
 
         roomId = getIntent().getStringExtra("roomId");
         role = getIntent().getStringExtra("role");
 
-        rootEglBase = EglBase.create();
-
-        surfaceTextureHelper = SurfaceTextureHelper.create("CaptureThread", rootEglBase.getEglBaseContext());
+        Button btnEnviar = findViewById(R.id.btnEnviar);
 
         if (!hasPermissions()) {
             requestPermissions();
         } else {
             init();
         }
+
+        btnEnviar.setOnClickListener(view -> {
+            stopRecording(); // para garantir que o vídeo foi salvo
+            uploadVideo(recordedFilePath);
+        });
     }
 
     private boolean hasPermissions() {
@@ -85,7 +99,7 @@ public class VideoStreamActivity extends AppCompatActivity implements SignalingC
 
     private void requestPermissions() {
         ActivityCompat.requestPermissions(this,
-                new String[] {Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO},
+                new String[]{Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO},
                 PERMISSION_REQUEST_CODE);
     }
 
@@ -116,11 +130,11 @@ public class VideoStreamActivity extends AppCompatActivity implements SignalingC
 
         localView.init(rootEglBase.getEglBaseContext(), null);
         localView.setMirror(true);
-        remoteView.init(rootEglBase.getEglBaseContext(), null);
-        remoteView.setMirror(false);
 
         PeerConnectionFactory.initialize(
                 PeerConnectionFactory.InitializationOptions.builder(this)
+                        .setEnableInternalTracer(true)
+                        .setFieldTrials("WebRTC-IntelVP8/Enabled/")
                         .createInitializationOptions());
 
         PeerConnectionFactory.Options options = new PeerConnectionFactory.Options();
@@ -135,13 +149,12 @@ public class VideoStreamActivity extends AppCompatActivity implements SignalingC
                 .setVideoDecoderFactory(decoderFactory)
                 .createPeerConnectionFactory();
 
+        surfaceTextureHelper = SurfaceTextureHelper.create("CaptureThread", rootEglBase.getEglBaseContext());
+
         VideoCapturer videoCapturer = createVideoCapturer();
 
         VideoSource videoSource = factory.createVideoSource(false);
-        videoCapturer.initialize(
-                surfaceTextureHelper,
-                getApplicationContext(),
-                videoSource.getCapturerObserver());
+        videoCapturer.initialize(surfaceTextureHelper, getApplicationContext(), videoSource.getCapturerObserver());
         videoCapturer.startCapture(640, 480, 30);
 
         localVideoTrack = factory.createVideoTrack("100", videoSource);
@@ -159,29 +172,21 @@ public class VideoStreamActivity extends AppCompatActivity implements SignalingC
 
         signalingClient = SignalingClient.getInstance();
         signalingClient.init("http://192.168.1.12:3000", roomId, role, this);
+        startRecording();
     }
 
     private VideoCapturer createVideoCapturer() {
         Camera2Enumerator enumerator = new Camera2Enumerator(this);
-        final String[] deviceNames = enumerator.getDeviceNames();
-
-        for (String deviceName : deviceNames) {
-            if (enumerator.isFrontFacing(deviceName)) {
+        for (String deviceName : enumerator.getDeviceNames()) {
+            if (enumerator.isBackFacing(deviceName)) {
                 VideoCapturer capturer = enumerator.createCapturer(deviceName, null);
-                if (capturer != null) {
-                    return capturer;
-                }
+                if (capturer != null) return capturer;
             }
         }
-
-        // Se não encontrar frontal, tenta qualquer uma
-        for (String deviceName : deviceNames) {
+        for (String deviceName : enumerator.getDeviceNames()) {
             VideoCapturer capturer = enumerator.createCapturer(deviceName, null);
-            if (capturer != null) {
-                return capturer;
-            }
+            if (capturer != null) return capturer;
         }
-
         throw new RuntimeException("Não foi possível encontrar capturador de vídeo");
     }
 
@@ -189,35 +194,72 @@ public class VideoStreamActivity extends AppCompatActivity implements SignalingC
         PeerConnection.RTCConfiguration rtcConfig = new PeerConnection.RTCConfiguration(com.example.mecanicavideo.Utils.getIceServers());
         rtcConfig.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN;
 
-        return factory.createPeerConnection(rtcConfig, new PeerConnectionAdapter() {
+        PeerConnection pc = factory.createPeerConnection(rtcConfig, new PeerConnection.Observer() {
             @Override
-            public void onIceCandidate(IceCandidate iceCandidate) {
-                super.onIceCandidate(iceCandidate);
-                try {
-                    JSONObject candidate = new JSONObject();
-                    candidate.put("sdpMid", iceCandidate.sdpMid);
-                    candidate.put("sdpMLineIndex", iceCandidate.sdpMLineIndex);
-                    candidate.put("candidate", iceCandidate.sdp);
-                    signalingClient.sendIceCandidate(candidate);
-                } catch (JSONException e) {
-                    e.printStackTrace();
-                }
+            public void onSignalingChange(PeerConnection.SignalingState signalingState) {
+                Log.d(TAG, "onSignalingChange: " + signalingState);
             }
 
             @Override
-            public void onAddStream(MediaStream mediaStream) {
-                super.onAddStream(mediaStream);
-                if (mediaStream.videoTracks.size() > 0) {
-                    mediaStream.videoTracks.get(0).addSink(remoteView);
-                }
+            public void onIceConnectionChange(PeerConnection.IceConnectionState iceConnectionState) {
+                Log.d(TAG, "onIceConnectionChange: " + iceConnectionState);
+            }
+
+            @Override
+            public void onIceConnectionReceivingChange(boolean receiving) {
+                Log.d(TAG, "onIceConnectionReceivingChange: " + receiving);
+            }
+
+            @Override
+            public void onIceGatheringChange(PeerConnection.IceGatheringState iceGatheringState) {
+                Log.d(TAG, "onIceGatheringChange: " + iceGatheringState);
+            }
+
+            @Override
+            public void onIceCandidate(IceCandidate candidate) {
+                Log.d(TAG, "onIceCandidate: " + candidate);
+            }
+
+            @Override
+            public void onIceCandidatesRemoved(IceCandidate[] candidates) {
+                Log.d(TAG, "onIceCandidatesRemoved");
+            }
+
+            @Override
+            public void onAddStream(MediaStream stream) {
+                Log.d(TAG, "onAddStream");
+            }
+
+            @Override
+            public void onRemoveStream(MediaStream stream) {
+                Log.d(TAG, "onRemoveStream");
+            }
+
+            @Override
+            public void onDataChannel(DataChannel dataChannel) {
+                Log.d(TAG, "onDataChannel");
+            }
+
+            @Override
+            public void onRenegotiationNeeded() {
+                Log.d(TAG, "onRenegotiationNeeded");
+            }
+
+            @Override
+            public void onAddTrack(RtpReceiver receiver, MediaStream[] mediaStreams) {
+                Log.d(TAG, "onAddTrack");
             }
         });
+
+        return pc;
     }
+
+    // Métodos do SignalingClient.SignalingEvents (exemplo simples)
 
     @Override
     public void onPeerJoined(String id, String role) {
-        Log.d(TAG, "Peer joined: " + id + ", role: " + role);
-        if ("client".equals(this.role)) {
+        if ("client".equals(role)) {
+            Log.d(TAG, "Vai criar a offer");
             createOffer();
         }
     }
@@ -225,56 +267,51 @@ public class VideoStreamActivity extends AppCompatActivity implements SignalingC
     private void createOffer() {
         MediaConstraints constraints = new MediaConstraints();
         peerConnection.createOffer(new org.webrtc.SdpObserver() {
+
             @Override
             public void onCreateSuccess(org.webrtc.SessionDescription sessionDescription) {
-                peerConnection.setLocalDescription(this, sessionDescription);
-                signalingClient.sendOffer(sessionDescription.description);
+                Log.d(TAG, "onCreateSuccess: Offer criada");
+                Log.d(TAG, "setLocalDescription vai ser chamado");
+                peerConnection.setLocalDescription(new org.webrtc.SdpObserver() {
+                    @Override
+                    public void onSetSuccess() {
+                        Log.d(TAG, "onSetSuccess: setLocalDescription OK");
+                        try {
+                            signalingClient.sendOffer(sessionDescription.description);
+                            Log.d(TAG, "Offer enviada");
+                        } catch (Exception e) {
+                            Log.e(TAG, "Erro ao enviar offer", e);
+                        }
+                    }
+                    @Override
+                    public void onSetFailure(String s) {
+                        Log.e(TAG, "onSetFailure: " + s);
+                    }
+                    @Override public void onCreateSuccess(SessionDescription sdp) {}
+                    @Override public void onCreateFailure(String s) {}
+                }, sessionDescription);
+                Log.d(TAG, "setLocalDescription chamado");
             }
 
-            @Override public void onSetSuccess() { }
+            @Override public void onSetSuccess() {}
             @Override public void onCreateFailure(String s) { Log.e(TAG, "Offer failure: " + s); }
-            @Override public void onSetFailure(String s) { Log.e(TAG, "Set local description failure: " + s); }
-        }, constraints);
-    }
-
-    @Override
-    public void onOffer(String fromId, String sdp) {
-        Log.d(TAG, "Offer received from " + fromId);
-        peerConnection.setRemoteDescription(new org.webrtc.SdpObserver() {
-            @Override
-            public void onSetSuccess() {
-                createAnswer();
-            }
-            @Override public void onSetFailure(String s) { Log.e(TAG, "Set remote desc failure: " + s); }
-            @Override public void onCreateSuccess(org.webrtc.SessionDescription sessionDescription) { }
-            @Override public void onCreateFailure(String s) { }
-        }, new org.webrtc.SessionDescription(org.webrtc.SessionDescription.Type.OFFER, sdp));
-    }
-
-    private void createAnswer() {
-        MediaConstraints constraints = new MediaConstraints();
-        peerConnection.createAnswer(new org.webrtc.SdpObserver() {
-            @Override
-            public void onCreateSuccess(org.webrtc.SessionDescription sessionDescription) {
-                peerConnection.setLocalDescription(this, sessionDescription);
-                signalingClient.sendAnswer(sessionDescription.description);
-            }
-
-            @Override public void onSetSuccess() { }
-            @Override public void onCreateFailure(String s) { Log.e(TAG, "Answer failure: " + s); }
             @Override public void onSetFailure(String s) { Log.e(TAG, "Set local desc failure: " + s); }
         }, constraints);
     }
 
     @Override
+    public void onOffer(String fromId, String sdp) {
+        // Se só enviar, você pode ignorar essa parte, ou adaptar se quiser responder
+    }
+
+    @Override
     public void onAnswer(String fromId, String sdp) {
-        Log.d(TAG, "Answer received from " + fromId);
         peerConnection.setRemoteDescription(new org.webrtc.SdpObserver() {
             @Override
-            public void onSetSuccess() { }
+            public void onSetSuccess() {}
             @Override public void onSetFailure(String s) { Log.e(TAG, "Set remote desc failure: " + s); }
-            @Override public void onCreateSuccess(org.webrtc.SessionDescription sessionDescription) { }
-            @Override public void onCreateFailure(String s) { }
+            @Override public void onCreateSuccess(org.webrtc.SessionDescription sessionDescription) {}
+            @Override public void onCreateFailure(String s) {}
         }, new org.webrtc.SessionDescription(org.webrtc.SessionDescription.Type.ANSWER, sdp));
     }
 
@@ -294,8 +331,98 @@ public class VideoStreamActivity extends AppCompatActivity implements SignalingC
 
     @Override
     public void onPeerLeft(String id) {
-        Log.d(TAG, "Peer left: " + id);
-        // Aqui pode fazer limpeza se quiser
+
+    }
+
+    private void startRecording() {
+        if (isRecording) return;
+
+        try {
+            // Define onde salvar
+            File file = new File(getExternalFilesDir(null), "gravacao.mp4");
+            recordedFilePath = file.getAbsolutePath();
+
+            mediaRecorder = new MediaRecorder();
+            mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+            mediaRecorder.setVideoSource(MediaRecorder.VideoSource.SURFACE);
+
+            mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+            mediaRecorder.setOutputFile(recordedFilePath);
+            mediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264);
+            mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+            mediaRecorder.setVideoEncodingBitRate(10000000);
+            mediaRecorder.setVideoFrameRate(30);
+            mediaRecorder.setVideoSize(640, 480);
+
+            mediaRecorder.prepare();
+
+            // ⚠️ IMPORTANTE: isso cria uma Surface que DEVE ser usada pela câmera
+            Surface recordingSurface = mediaRecorder.getSurface();
+
+            // Agora você precisa redirecionar os frames para essa surface
+            // Isso só é possível com Camera2 API, NÃO com WebRTC direto.
+            // Então aqui está a limitação: WebRTC não pode compartilhar a surface com MediaRecorder diretamente.
+            // Como solução simples: grave da câmera separadamente (fora do WebRTC) OU use uma biblioteca que suporte múltiplas saídas.
+
+            Log.e(TAG, "⚠️ MediaRecorder preparado, mas NÃO está recebendo frames pois não há ligação com a câmera.");
+
+            mediaRecorder.start();
+            isRecording = true;
+        } catch (Exception e) {
+            Log.e(TAG, "Erro ao iniciar gravação", e);
+        }
+    }
+
+    private void stopRecording() {
+        if (!isRecording) return;
+
+        try {
+            mediaRecorder.stop();
+            mediaRecorder.release();
+            mediaRecorder = null;
+            isRecording = false;
+        } catch (Exception e) {
+            Log.e(TAG, "Erro ao parar gravação", e);
+        }
+    }
+
+    private void uploadVideo(String filePath) {
+        new Thread(() -> {
+            try {
+                File videoFile = new File(filePath);
+                String boundary = "----WebKitFormBoundary" + System.currentTimeMillis();
+
+                URL url = new URL("http://192.168.1.12:3000/api/upload/upload-video");
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("POST");
+                conn.setDoOutput(true);
+                conn.setDoInput(true);
+                conn.setUseCaches(false);
+                conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
+
+                DataOutputStream request = new DataOutputStream(conn.getOutputStream());
+                request.writeBytes("--" + boundary + "\r\n");
+                request.writeBytes("Content-Disposition: form-data; name=\"video\"; filename=\"" + videoFile.getName() + "\"\r\n");
+                request.writeBytes("Content-Type: video/mp4\r\n\r\n");
+
+                FileInputStream inputStream = new FileInputStream(videoFile);
+                byte[] buffer = new byte[4096];
+                int bytesRead;
+                while ((bytesRead = inputStream.read(buffer)) != -1) {
+                    request.write(buffer, 0, bytesRead);
+                }
+                inputStream.close();
+
+                request.writeBytes("\r\n--" + boundary + "--\r\n");
+                request.flush();
+                request.close();
+
+                int responseCode = conn.getResponseCode();
+                Log.d(TAG, "Upload resposta: " + responseCode);
+            } catch (Exception e) {
+                Log.e(TAG, "Erro ao fazer upload: ", e);
+            }
+        }).start();
     }
 
     @Override
@@ -312,9 +439,6 @@ public class VideoStreamActivity extends AppCompatActivity implements SignalingC
         if (rootEglBase != null) {
             rootEglBase.release();
             rootEglBase = null;
-        }
-        if (signalingClient != null) {
-            signalingClient.disconnect();
         }
     }
 }
